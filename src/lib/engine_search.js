@@ -47,6 +47,27 @@ const ENGINES = [
     },
   },
   {
+    // Mojeek runs its own index and is far friendlier to datacenter IPs
+    // than Bing / DDG; supports the site: operator and returns plain
+    // direct result links.
+    name: 'mojeek',
+    url: (q) => `https://www.mojeek.com/search?q=${encodeURIComponent(q)}`,
+    headers: {
+      'User-Agent': MOBILE_UA,
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'accept-language': 'en-US,en;q=0.9',
+    },
+  },
+  {
+    name: 'brave',
+    url: (q) => `https://search.brave.com/search?q=${encodeURIComponent(q)}&source=web`,
+    headers: {
+      'User-Agent': MOBILE_UA,
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'accept-language': 'en-US,en;q=0.9',
+    },
+  },
+  {
     name: 'ddg-lite',
     url: (q) => `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(q)}`,
     headers: {
@@ -61,7 +82,12 @@ const ENGINES = [
 // every replay, so this keeps the service light.
 const SEARCH_CACHE_TTL_MS = 30 * 60 * 1000;
 const SEARCH_CACHE_MAX = 200;
+// An EMPTY answer is almost always a blocked / challenged engine, not "no
+// reel exists" - caching it for 30 minutes made every later request for the
+// same song return nothing instantly. Empty answers are kept 45 s only.
+const EMPTY_CACHE_TTL_MS = 45 * 1000;
 const searchCache = new Map(); // query -> { at, results }
+const inflight = new Map(); // query -> Promise (same query shares one run)
 
 function b64urlDecode(raw) {
   let s = raw.replace(/-/g, '+').replace(/_/g, '/');
@@ -209,10 +235,21 @@ async function searchReels(query) {
   }
 
   const cached = searchCache.get(normalized);
-  if (cached && Date.now() - cached.at < SEARCH_CACHE_TTL_MS) {
-    return cached.results;
+  if (cached) {
+    const ttl = cached.results.length > 0 ? SEARCH_CACHE_TTL_MS : EMPTY_CACHE_TTL_MS;
+    if (Date.now() - cached.at < ttl) return cached.results;
   }
 
+  // Identical queries arriving together (several app sessions / retries)
+  // share one engine run instead of each hammering the engines.
+  const running = inflight.get(normalized);
+  if (running) return running;
+  const job = runSearch(normalized).finally(() => inflight.delete(normalized));
+  inflight.set(normalized, job);
+  return job;
+}
+
+async function runSearch(normalized) {
   const settled = await Promise.allSettled(
     ENGINES.map((engine) => fetchEngine(engine, normalized))
   );

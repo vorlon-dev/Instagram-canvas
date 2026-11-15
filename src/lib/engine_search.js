@@ -208,10 +208,26 @@ async function fetchEngine(engine, query) {
     }
   }
 
-  if (!body || statusCode !== 200) {
-    return new Map();
+  const empty = !body || statusCode !== 200;
+  const found = empty ? new Map() : collectCandidates(body);
+  // One line per engine per query: shows in the host log WHY a search came
+  // back empty (blocked / challenged / simply no instagram links).
+  console.log( // eslint-disable-line no-console
+    `[engine] ${engine.name} status=${statusCode} len=${(body || '').length} ` +
+    `via=${via} challenged=${looksChallenged(statusCode, body)} found=${found.size}`
+  );
+  if (fetchEngine.debugSink) {
+    fetchEngine.debugSink.push({
+      engine: engine.name,
+      status: statusCode,
+      length: (body || '').length,
+      via,
+      challenged: looksChallenged(statusCode, body),
+      found: found.size,
+      head: (body || '').replace(/\s+/g, ' ').slice(0, 160),
+    });
   }
-  return collectCandidates(body);
+  return found;
 }
 
 // Cheap heuristics for challenge/bot walls and junk responses.
@@ -283,4 +299,17 @@ async function runSearch(normalized) {
   return results;
 }
 
-module.exports = { searchReels };
+// Diagnostic: run every engine once for [query] (no cache) and report what
+// each really answered. Used by GET /api/search-debug.
+async function debugEngines(query) {
+  const sink = [];
+  fetchEngine.debugSink = sink;
+  try {
+    await Promise.allSettled(ENGINES.map((e) => fetchEngine(e, String(query))));
+  } finally {
+    fetchEngine.debugSink = null;
+  }
+  return sink;
+}
+
+module.exports = { searchReels, debugEngines };

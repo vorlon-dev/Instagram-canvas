@@ -5,7 +5,7 @@ const asyncHandler = require('express-async-handler')
 
 const { getPostId, getVideoUrl } = require('../lib/utils');
 const { resolveViaEmbed, BROWSER_UA } = require('../lib/ig_client');
-const { searchReels } = require('../lib/engine_search');
+const { searchReels, debugEngines } = require('../lib/engine_search');
 const { ensureObscuraServe } = require('../lib/obscura_client');
 const { handleBlockedResources } = require('../lib/scraper');
 const { CustomError } = require('../lib/errors');
@@ -193,6 +193,16 @@ router.get('/search', asyncHandler(async (req, res) => {
     count: results.length,
     results: results.slice(0, limit),
   });
+}));
+
+
+// GET /api/search-debug?q=... -> what each search engine answered from THIS
+// server (status, size, challenge wall?, links found). For diagnosing empty
+// /api/search results.
+router.get('/search-debug', asyncHandler(async (req, res) => {
+  const q = (req.query.q || 'site:instagram.com/reel "Chaleya" edit').toString();
+  const engines = await debugEngines(q);
+  return res.status(200).json({ query: q, engines });
 }));
 
 

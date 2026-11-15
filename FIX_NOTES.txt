@@ -1,0 +1,184 @@
+SP72 helper upgrade v4 - Obscura stealth browser integration
+==============================================================
+
+Why
+---
+Two long-standing weak points, one fix:
+
+1. Full Chromium (puppeteer's bundled download, ~300 MB) cannot install or
+   run on small serverless VMs - that was the original deploy crash. The
+   browser fallback has therefore been dead weight since v2.
+2. Search engines sometimes serve JS challenge walls (DDG anomaly pages,
+   consent pages) that plain HTTPS fetches can never pass, and Instagram
+   may checkpoint page requests from server IPs.
+
+Obscura (https://github.com/h4ckf0r0day/obscura, v0.2.6) is a single
+static Rust binary (~63 MB, zero system deps) that renders pages with a
+real V8 + Chrome-145 fingerprint + TLS impersonation (stealth mode), and
+speaks the Chrome DevTools Protocol - so puppeteer.connect() works
+against `obscura serve` exactly like against Chrome.
+
+What was added
+--------------
+- src/lib/obscura_client.js (new):
+  * Binary resolution order: $OBSCURA_PATH -> ./bin/obscura -> ./obscura
+    -> auto-download (only the main binary; the worker is not needed for
+    fetch/serve - verified on v0.2.6) into $OBSCURA_DIR (default
+    $TMPDIR/obscura-bin). Auto-download is on by default and fail-soft.
+  * ensureObscuraServe(): lazy, concurrency-safe CDP server on
+    $OBSCURA_PORT (default 9222). Reuses an already-running server.
+  * fetchHtmlViaCli(url, timeout): one-shot stealth render of a page.
+  * obscuraStatus(): diag info.
+- src/routes/index.js: the browser fallback now CONNECTS to Obscura when
+  available (domcontentloaded + settle, disconnect instead of close) and
+  only falls back to puppeteer.launch()/Chromium when Obscura is absent.
+- src/lib/engine_search.js: per-engine challenge detection (non-200, tiny
+  pages, anomaly/captcha markers scanned across the WHOLE body). When an
+  engine response looks challenged AND the Obscura binary is present, the
+  same engine URL is re-fetched through the stealth browser. Still
+  fail-soft: no Obscura = exactly the v3 behaviour.
+- src/bin/www: non-blocking pre-warm of the Obscura binary at boot.
+- /api/diag: new `obscura` block (enabled, binaryPath, present,
+  autoDownload, version, port); add ?obscura=1 to also start/verify the
+  CDP server.
+
+Environment variables (all optional)
+------------------------------------
+  OBSCURA_ENABLED=0          disable everything Obscura (default on)
+  OBSCURA_PATH=/path/obscura use this binary
+  OBSCURA_DIR=...            where the auto-downloaded binary lives
+                             (default $TMPDIR/obscura-bin)
+  OBSCURA_AUTO_DOWNLOAD=0    never download (default: download when missing)
+  OBSCURA_PORT=9222          CDP serve port
+  OBSCURA_VERSION=v0.2.6     pinned release
+
+Testing (sandbox, hostile datacenter IP)
+----------------------------------------
+* puppeteer.connect({browserURL: http://127.0.0.1:9222}) against
+  `obscura --stealth serve`: page.goto/title/content, tab reuse and
+  disconnect all verified - Obscura stays alive after disconnect.
+* `obscura fetch <url> --dump html` renders in <100 ms for simple pages.
+* /api/search stays 200/empty on engine poison pages and passes challenge
+  pages to the obscura transport when the binary is present.
+
+Nothing else changed: /api/video, /api/stream, /api/search response
+shapes are identical to v3; the app needs no update.
+
+SP72 helper upgrade v3 - server-side reel search (GET /api/search)
+===================================================================
+
+Why
+---
+The app's canvas feature needs to DISCOVER reels for a song (per-song
+related-tag queries like: site:instagram.com/reel "<song> <artist> edit").
+Engines answer differently per IP - a phone's carrier IP and hostile
+datacenter IPs often get challenged or region-mangled results. The server's
+IP is usually cleaner, so the same search now runs here first.
+
+What was added
+--------------
+- src/lib/engine_search.js (new): runs ONE engine query across Bing,
+  DuckDuckGo html and DuckDuckGo lite IN PARALLEL, decodes direct and
+  engine-wrapped result links (Bing &u=a1 base64url, DDG uddg=, Google
+  /url?q=), and returns candidate Instagram post shortcodes with nearby
+  result text: [{ code, text, isReel }]. /p/ posts are accepted (photo
+  posts fail the app's validation later); reels are flagged so the app can
+  prefer them. 30-minute cache per query (max 200 entries). Fail-soft:
+  engines that fail just yield fewer candidates; empty list when all fail.
+- src/routes/index.js: GET /api/search?q={query}&limit=12 (limit 1-30,
+  q 3-300 chars). Response: { query, count, results: [{ code, text, isReel }] }.
+
+Nothing else changed: /api/video, /api/stream, /api/diag, / behave exactly
+as in v2 (embed-first keyless resolve, browser only as last resort).
+
+App pairing
+-----------
+The app (instagram_canvas folder) calls /api/search first for every per-song
+query and falls back to its own on-device engines when this endpoint is
+missing (older deploy), down, or empty.
+
+SP72 helper fix v2 - deploy notes (Linux / serverless safe)
+============================================================
+
+v2 headline: the main resolve path now needs NO headless browser at all.
+
+Root cause of the original failed deploy
+----------------------------------------
+package.json started the app with:
+
+    "start": "SET NODE_ENV=production && node ./src/bin/www"
+
+`SET` is a Windows cmd command. Linux serverless hosts run the script with
+`sh`, so it failed with `sh: 1: SET: not found` (exit code 127) on every
+restart, and the deploy was marked failed because nothing ever answered on
+port 3000.
+
+Root cause of the "Internal Server Error" after the first fix (v1)
+------------------------------------------------------------------
+The scrape step launched headless Chromium via puppeteer. On small
+serverless machines Chromium often cannot run (not downloaded, missing
+system libraries, or too little memory) - every /api/video request then
+failed with a generic 500.
+
+v2 resolve chain (per request, cached 1 hour per post)
+------------------------------------------------------
+1. KEYLESS EMBED RESOLVE (new, no browser):
+   GET https://www.instagram.com/reel/{id}/embed/captioned/ with a desktop
+   Chrome UA, then extract the "video_url" CDN mp4 from the embedded JSON.
+   Verified working from datacenter IPs with zero login - returns a direct
+   mp4 URL that plays cross-IP with Range support (HTTP 206).
+2. HEADLESS CHROMIUM (previous method, now only a fallback):
+   used only if the embed page no longer contains a video URL.
+3. If both fail: descriptive JSON error, never a crash.
+
+What was changed (vs. upstream riad-azz/instagram-video-scraper)
+----------------------------------------------------------------
+1. package.json
+   - start:  "node ./src/bin/www"            (Linux-safe; NODE_ENV defaults
+   - dev:    "nodemon ./src/bin/www"          to production inside bin/www)
+
+2. src/bin/www
+   - NODE_ENV defaults to "production" when the host does not set it.
+   - Process-level unhandledRejection / uncaughtException handlers log and
+     keep the server alive (Express 4 does not catch async errors).
+
+3. src/app.js
+   - GET / health endpoint: { "status": "ok" } (no browser cost).
+   - GET /api/diag endpoint: reports node version, Chromium path/presence,
+     optional real launch test (?launch=1), IG_COOKIE status.
+
+4. src/middleware/scraperHandler.js
+   - Headless Chromium is launched lazily and only for API routes that need
+     it (diag/health excluded).
+   - Launch failures return a clean JSON error instead of crashing.
+
+5. src/lib/ig_client.js (NEW)
+   - Keyless embed-page resolver with desktop UA, redirect following, 8s
+     timeout, 2MB body cap, and escape-depth-robust video URL extraction.
+
+6. src/routes/index.js
+   - /api/video: embed-first resolve chain; response { videoUrl, source }.
+   - /api/stream (NEW): resolves the post, then proxies the video bytes
+     with HTTP Range support - use when a client cannot play the CDN URL
+     directly (e.g. IP-locked signatures).
+   - Optional IG_COOKIE env var support for login-walled Instagram.
+   - Robust tab cleanup, 25s page-load timeout on the browser path.
+
+7. src/middleware/errorHandler.js
+   - Generic errors now include a "detail" field with the real cause.
+
+Endpoints
+---------
+GET /                      -> health check
+GET /api/diag[?launch=1]   -> environment diagnostics
+GET /api/video?url=...     -> { "videoUrl": "https://...mp4?...", "source": "embed" }
+GET /api/stream?url=...    -> raw video bytes (supports Range / seeking)
+
+All errors return JSON like { "message": "...", "detail": "..." } - the
+server never crashes on upstream failures.
+
+Environment variables (all optional)
+------------------------------------
+PORT       - port to listen on (defaults to 3000)
+IG_COOKIE  - raw cookie header ("sessionid=...; ds_user_id=...") used only
+             if Instagram login-walls anonymous requests

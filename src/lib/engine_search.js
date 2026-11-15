@@ -21,7 +21,13 @@ const MOBILE_UA =
 // URL of any Instagram post kind, capturing the code.
 const POST_URL_RE =
   /https?:\/\/(?:www\.)?instagram\.com\/(reel|reels|p)\/([A-Za-z0-9_-]{5,25})/g;
-const BING_WRAP_RE = /&u=a1([A-Za-z0-9_\-%]{20,})/g;
+// Bing result links look like  .../ck/a?!&amp;&amp;p=...&amp;u=a1aHR0cHM6...
+// In the HTML the ampersands are ENTITIES (&amp;), so the old /&u=a1.../
+// never matched and every Bing page yielded zero links.
+const BING_WRAP_RE = /[?&;]u=a1([A-Za-z0-9_\-%]{20,})/g;
+// The visible <cite> breadcrumb:  instagram.com › reel › DfuUTROyNNV
+const CITE_RE =
+  /instagram\.com\s*(?:›|&rsaquo;|&#8250;|&#x203A;|&gt;)\s*(reels?|p)\s*(?:›|&rsaquo;|&#8250;|&#x203A;|&gt;)\s*([A-Za-z0-9_-]{5,25})/gi;
 const DDG_WRAP_RE = /uddg=([A-Za-z0-9_%\-.]{10,400})/g;
 const GOOGLE_WRAP_RE = /\/url\?q=([^&"'\s]{10,400})/g;
 
@@ -145,6 +151,9 @@ function collectCandidates(body) {
     if (!/(reel|reels|p)\/[A-Za-z0-9_-]{5,25}/.test(decoded)) continue;
     spots.push(`${decoded} ${contextText(body, m.index)}`);
   }
+  for (const m of body.matchAll(CITE_RE)) {
+    spots.push(`https://www.instagram.com/${m[1]}/${m[2]} ${contextText(body, m.index)}`);
+  }
   for (const m of body.matchAll(GOOGLE_WRAP_RE)) {
     const decoded = decodeURIComponentSafe(m[1]);
     if (!/(reel|reels|p)\/[A-Za-z0-9_-]{5,25}/.test(decoded)) continue;
@@ -224,6 +233,8 @@ async function fetchEngine(engine, query) {
       via,
       challenged: looksChallenged(statusCode, body),
       found: found.size,
+      igMentions: ((body || '').match(/instagram\.com/g) || []).length,
+      bingLinks: ((body || '').match(/[?&;]u=a1/g) || []).length,
       head: (body || '').replace(/\s+/g, ' ').slice(0, 160),
     });
   }

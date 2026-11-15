@@ -66,6 +66,13 @@ app.get('/api/diag', async (req, res) => {
   });
 });
 
+// Tolerate clients whose base URL ends with '/' (requests like
+// //api/search used to 404): collapse leading duplicate slashes.
+app.use((req, res, next) => {
+  if (req.url.startsWith('//')) req.url = req.url.replace(/^\/{2,}/, '/');
+  next();
+});
+
 app.use(cors());
 app.use(helmet()); // https://expressjs.com/en/advanced/best-practice-security.html#use-helmet
 app.use(logger('dev'));

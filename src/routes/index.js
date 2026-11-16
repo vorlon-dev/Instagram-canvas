@@ -187,7 +187,7 @@ router.get('/search', asyncHandler(async (req, res) => {
     ? Math.min(Math.max(limitRaw, 1), 30)
     : 12;
 
-  const results = await searchReels(query);
+  const results = await searchReels(query, (req.query.t || '').toString().slice(0, 120));
   return res.status(200).json({
     query,
     count: results.length,

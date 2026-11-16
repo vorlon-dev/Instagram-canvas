@@ -10,7 +10,7 @@
 // when every engine fails an empty list is returned so the app falls back
 // to its own on-device engines.
 
-const { httpGet } = require('./ig_client');
+const { httpGet, BROWSER_UA } = require('./ig_client');
 const { fetchHtmlViaCli, obscuraBinaryPresent } = require('./obscura_client');
 
 // A browser-like mobile UA — engines are friendlier to it than to defaults.
@@ -252,10 +252,98 @@ function looksChallenged(statusCode, body) {
   return false;
 }
 
+// ── Instagram hashtag search with the IG_COOKIE session ──────────────────
+// The song title becomes a hashtag (#aanewalastar); Instagram's own
+// web_info endpoint returns the top + recent media for it, with the
+// shortcode and caption of every post. Needs a logged-in cookie.
+
+function cookieHeaders() {
+  const cookie = process.env.IG_COOKIE || '';
+  const csrf = /(?:^|;\s*)csrftoken=([^;]+)/.exec(cookie);
+  return {
+    'user-agent': BROWSER_UA,
+    accept: '*/*',
+    'accept-language': 'en-US,en;q=0.9',
+    cookie,
+    'x-ig-app-id': '936619743392459',
+    'x-requested-with': 'XMLHttpRequest',
+    referer: 'https://www.instagram.com/',
+    ...(csrf ? { 'x-csrftoken': csrf[1] } : {}),
+  };
+}
+
+function tagCandidates(title) {
+  const words = String(title)
+    .toLowerCase()
+    .replace(/\([^)]*\)|\[[^\]]*\]/g, ' ')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+  const tags = [];
+  const full = words.join('');
+  if (full.length >= 4 && full.length <= 40) tags.push(full);
+  if (words.length > 2) {
+    const firstTwo = words.slice(0, 2).join('');
+    if (firstTwo.length >= 5 && !tags.includes(firstTwo)) tags.push(firstTwo);
+  }
+  return tags.slice(0, 2);
+}
+
+function collectMedia(node, out, depth = 0) {
+  if (!node || typeof node !== 'object' || depth > 12) return;
+  if (Array.isArray(node)) {
+    node.forEach((n) => collectMedia(n, out, depth + 1));
+    return;
+  }
+  if (typeof node.code === 'string' && node.code.length >= 5 &&
+      (node.media_type === 2 || Array.isArray(node.video_versions))) {
+    out.push(node);
+    return;
+  }
+  Object.values(node).forEach((v) => collectMedia(v, out, depth + 1));
+}
+
+async function searchViaCookie(title) {
+  const found = new Map();
+  for (const tag of tagCandidates(title)) {
+    const url = `https://www.instagram.com/api/v1/tags/web_info/?tag_name=${encodeURIComponent(tag)}`;
+    let response;
+    try {
+      response = await httpGet(url, cookieHeaders());
+    } catch (e) {
+      console.log(`[cookie-search] #${tag} error: ${e.message}`); // eslint-disable-line no-console
+      continue;
+    }
+    console.log(`[cookie-search] #${tag} status=${response.statusCode} len=${response.body.length}`); // eslint-disable-line no-console
+    if (response.statusCode !== 200) continue;
+    let json;
+    try {
+      json = JSON.parse(response.body);
+    } catch (_) {
+      continue;
+    }
+    const medias = [];
+    collectMedia(json, medias);
+    for (const m of medias) {
+      if (found.has(m.code)) continue;
+      const caption = (m.caption && m.caption.text) ? String(m.caption.text) : '';
+      found.set(m.code, {
+        code: m.code,
+        // The post is under this song's hashtag, so the title is part of
+        // its text for the app-side scoring.
+        text: `${title} ${caption}`.replace(/\s+/g, ' ').slice(0, 200),
+        isReel: m.product_type === 'clips',
+      });
+    }
+    if (found.size >= 12) break;
+  }
+  return Array.from(found.values());
+}
+
 // Run all engines in parallel for one query and merge their candidates.
 // Returns [{ code, text, isReel }] — empty when every engine failed or
 // found nothing (the app then tries its own on-device engines).
-async function searchReels(query) {
+async function searchReels(query, title) {
   const normalized = String(query || '').trim();
   if (normalized.length < 3) {
     return [];
@@ -271,12 +359,12 @@ async function searchReels(query) {
   // share one engine run instead of each hammering the engines.
   const running = inflight.get(normalized);
   if (running) return running;
-  const job = runSearch(normalized).finally(() => inflight.delete(normalized));
+  const job = runSearch(normalized, title).finally(() => inflight.delete(normalized));
   inflight.set(normalized, job);
   return job;
 }
 
-async function runSearch(normalized) {
+async function runSearch(normalized, title) {
   const settled = await Promise.allSettled(
     ENGINES.map((engine) => fetchEngine(engine, normalized))
   );
@@ -295,11 +383,21 @@ async function runSearch(normalized) {
     }
   }
 
-  const results = Array.from(merged.entries()).map(([code, cand]) => ({
+  let results = Array.from(merged.entries()).map(([code, cand]) => ({
     code,
     text: cand.text.slice(0, 200),
     isReel: cand.isReel,
   }));
+
+  // Web engines blocked / empty -> ask Instagram itself with the session
+  // cookie (IG_COOKIE). Only runs when a cookie is configured.
+  if (results.length === 0 && process.env.IG_COOKIE && title) {
+    try {
+      results = await searchViaCookie(String(title));
+    } catch (e) {
+      console.log(`[cookie-search] failed: ${e.message}`); // eslint-disable-line no-console
+    }
+  }
 
   if (searchCache.size >= SEARCH_CACHE_MAX) {
     const firstKey = searchCache.keys().next().value;
